@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "releases": [
+    {
+      "product": "Behringer X-Touch",
+      "model": "full-size",
+      "version": "1.25",
+      "payloadFile": "X-TOUCH_sysex_update_1-25_1-07.syx",
+      "payloadSHA256": "d17daae1e7973f9e2eca24fe57a0a4aa705ab121c6ff33ccd29548cc2ee68b8c",
+      "payloadBytes": 80647,
+      "packetCount": 897,
+      "archiveFile": "X-TOUCH_sysex_update_1-25_1-07.zip",
+      "archiveSHA256": "fff6aa741ac9983bb5fece08c792351048892d2e41514682057293563aa1593d",
+      "sourceURL": "https://cdn-media.empowertribe.com/9a6b284bceddbd1c6353426a4a9aac85/X-TOUCH_sysex_update_1-25_1-07.zip",
+      "verifiedAt": "2026-08-15"
+    }
+  ]
+}
