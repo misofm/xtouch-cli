@@ -2,17 +2,21 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/misofm/xtouch-cli/internal/firmware"
 	"github.com/misofm/xtouch-cli/internal/midi"
+	"github.com/misofm/xtouch-cli/surface"
 )
 
 var version = "0.1.0-dev"
@@ -39,6 +43,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return nil
 	case "devices":
 		return runDevices(args[1:], stdout)
+	case "simulate":
+		return runSimulate(args[1:], stdin, stdout, stderr)
 	case "firmware":
 		return runFirmware(args[1:], stdin, stdout, stderr)
 	default:
@@ -51,12 +57,389 @@ func printUsage(output io.Writer) {
 
 Usage:
   xtouch-cli devices
-  xtouch-cli firmware inspect FILE
+	  xtouch-cli simulate describe
+	  xtouch-cli simulate run [--script FILE]
+	  xtouch-cli simulate serve
+	  xtouch-cli firmware inspect FILE
   xtouch-cli firmware trusted
   xtouch-cli firmware send --destination INDEX_OR_NAME FILE
   xtouch-cli version
 
+Simulation is deterministic and never opens a MIDI device.
 Firmware sending is safety-gated, rate-limited, and never happens implicitly.`)
+}
+
+type simulationRequest struct {
+	ID           json.RawMessage `json:"id,omitempty"`
+	Type         string          `json:"type"`
+	Bytes        []int           `json:"bytes,omitempty"`
+	Control      string          `json:"control,omitempty"`
+	Pressed      *bool           `json:"pressed,omitempty"`
+	Fader        json.RawMessage `json:"fader,omitempty"`
+	Position     int             `json:"position,omitempty"`
+	Encoder      int             `json:"encoder,omitempty"`
+	Delta        int             `json:"delta,omitempty"`
+	Value        int             `json:"value,omitempty"`
+	Milliseconds int             `json:"milliseconds,omitempty"`
+}
+
+type simulationResponse struct {
+	Schema        string            `json:"schema"`
+	Type          string            `json:"type"`
+	ID            json.RawMessage   `json:"id,omitempty"`
+	Error         string            `json:"error,omitempty"`
+	Changed       []string          `json:"changed,omitempty"`
+	MIDI          [][]int           `json:"midi,omitempty"`
+	MIDIDirection string            `json:"midiDirection,omitempty"`
+	Warning       string            `json:"warning,omitempty"`
+	State         *surface.Snapshot `json:"state,omitempty"`
+	Device        string            `json:"device,omitempty"`
+}
+
+func runSimulate(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) == 0 || args[0] == "run" {
+		if len(args) > 0 {
+			args = args[1:]
+		}
+		return runSimulation(args, stdin, stdout, stderr)
+	}
+	if args[0] == "describe" {
+		if len(args) != 1 {
+			return errors.New("usage: xtouch-cli simulate describe")
+		}
+		description := struct {
+			Schema     string                      `json:"schema"`
+			Device     string                      `json:"device"`
+			Mode       string                      `json:"mode"`
+			Controls   []surface.ControlDefinition `json:"controls"`
+			References []string                    `json:"references"`
+			Caveats    []string                    `json:"caveats"`
+		}{
+			Schema:   "xtouch.surface-description/v1",
+			Device:   "Behringer X-Touch (full-size)",
+			Mode:     "Mackie Control (MC)",
+			Controls: surface.ControlDefinitions(),
+			References: []string{
+				"https://cdn-media.empowertribe.com/5f4ebaa5746d48b39c2bc317641de448/QSG_BE_0808-AAD_X-TOUCH_WW.pdf",
+				"https://github.com/NicoG60/TouchMCU/blob/main/doc/mackie_control_protocol.md",
+			},
+			Caveats: []string{
+				"The X-Touch manual defines physical controls; host applications define their semantics.",
+				"Controls marked needs-hardware-validation are modeled from corroborated reverse engineering but are not yet verified on this firmware-1.25 unit.",
+			},
+		}
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(description)
+	}
+	if args[0] == "serve" {
+		return runSimulationServe(args[1:], stdin, stdout, stderr)
+	}
+	return fmt.Errorf("unknown simulate command %q", args[0])
+}
+
+func runSimulationServe(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("simulate serve", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	name := flags.String("name", "X-Touch Simulator INT", "CoreMIDI input/output endpoint name")
+	firmwareVersion := flags.String("firmware", "V1.25", "firmware version returned by identity requests")
+	stayOpen := flags.Bool("stay-open", false, "keep endpoints alive after stdin reaches EOF")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: xtouch-cli simulate serve [--name NAME] [--stay-open]")
+	}
+
+	device, err := midi.OpenVirtualDevice(*name)
+	if err != nil {
+		return err
+	}
+	defer device.Close()
+	model := surface.NewModel(*firmwareVersion)
+	encoder := json.NewEncoder(stdout)
+	if err := encoder.Encode(simulationResponse{
+		Schema: "xtouch.sim/v1", Type: "ready", Device: device.Name(),
+	}); err != nil {
+		return err
+	}
+
+	lines := make(chan string)
+	scanErrors := make(chan error, 1)
+	go scanLines(stdin, lines, scanErrors)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	lineNumber := 0
+	for {
+		select {
+		case <-signals:
+			return nil
+		case scanErr := <-scanErrors:
+			if scanErr != nil {
+				return fmt.Errorf("read simulation commands: %w", scanErr)
+			}
+			scanErrors = nil
+		case line, ok := <-lines:
+			if !ok {
+				lines = nil
+				if !*stayOpen {
+					return nil
+				}
+				continue
+			}
+			lineNumber++
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var request simulationRequest
+			if err := json.Unmarshal([]byte(line), &request); err != nil {
+				if err := encoder.Encode(newSimulationErrorResponse(nil, lineNumber, "", fmt.Errorf("decode JSON: %w", err))); err != nil {
+					return err
+				}
+				continue
+			}
+			response, err := applySimulationRequest(model, request)
+			if err != nil {
+				if err := encoder.Encode(newSimulationErrorResponse(request.ID, lineNumber, request.Type, err)); err != nil {
+					return err
+				}
+				continue
+			}
+			for _, message := range response.MIDI {
+				bytes, conversionErr := midiBytes(message)
+				if conversionErr != nil {
+					return conversionErr
+				}
+				if err := device.Send(bytes); err != nil {
+					return err
+				}
+			}
+			if err := encoder.Encode(response); err != nil {
+				return err
+			}
+		case message, ok := <-device.Received():
+			if !ok {
+				return errors.New("virtual MIDI endpoint closed unexpectedly")
+			}
+			result, applyErr := model.ApplyHostMIDI(message)
+			response := simulationResponse{
+				Schema: "xtouch.sim/v1", Type: "host.midi", MIDI: integerMessages([][]byte{message}),
+				MIDIDirection: "host-to-device", Changed: result.Changed, Warning: result.Warning,
+			}
+			if applyErr != nil {
+				response.Type = "error"
+				response.Warning = applyErr.Error()
+			}
+			for _, reply := range result.Outbound {
+				if err := device.Send(reply); err != nil {
+					return err
+				}
+			}
+			if err := encoder.Encode(response); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func newSimulationErrorResponse(id json.RawMessage, lineNumber int, requestType string, err error) simulationResponse {
+	context := fmt.Sprintf("simulation line %d", lineNumber)
+	if requestType != "" {
+		context += fmt.Sprintf(" (%s)", requestType)
+	}
+	return simulationResponse{
+		Schema: "xtouch.sim/v1",
+		Type:   "error",
+		ID:     id,
+		Error:  fmt.Sprintf("%s: %v", context, err),
+	}
+}
+
+func scanLines(input io.Reader, lines chan<- string, scanErrors chan<- error) {
+	defer close(lines)
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		lines <- scanner.Text()
+	}
+	scanErrors <- scanner.Err()
+}
+
+func runSimulation(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("simulate run", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	scriptPath := flags.String("script", "", "read NDJSON commands from FILE instead of stdin")
+	firmwareVersion := flags.String("firmware", "V1.25", "firmware version returned by identity requests")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("usage: xtouch-cli simulate run [--script FILE]")
+	}
+
+	input := stdin
+	var file *os.File
+	if *scriptPath != "" {
+		opened, err := os.Open(*scriptPath)
+		if err != nil {
+			return fmt.Errorf("open simulation script: %w", err)
+		}
+		file = opened
+		defer file.Close()
+		input = file
+	}
+
+	model := surface.NewModel(*firmwareVersion)
+	encoder := json.NewEncoder(stdout)
+	scanner := bufio.NewScanner(input)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	lineNumber := 0
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var request simulationRequest
+		if err := json.Unmarshal([]byte(line), &request); err != nil {
+			return fmt.Errorf("simulation line %d: decode JSON: %w", lineNumber, err)
+		}
+		response, err := applySimulationRequest(model, request)
+		if err != nil {
+			return fmt.Errorf("simulation line %d (%s): %w", lineNumber, request.Type, err)
+		}
+		if err := encoder.Encode(response); err != nil {
+			return fmt.Errorf("write simulation response: %w", err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read simulation commands: %w", err)
+	}
+	return nil
+}
+
+func applySimulationRequest(model *surface.Model, request simulationRequest) (simulationResponse, error) {
+	response := simulationResponse{
+		Schema: "xtouch.sim/v1", Type: "result", ID: request.ID,
+	}
+	var result surface.ApplyResult
+	var err error
+	switch request.Type {
+	case "host.midi":
+		message, conversionErr := midiBytes(request.Bytes)
+		if conversionErr != nil {
+			return response, conversionErr
+		}
+		result, err = model.ApplyHostMIDI(message)
+	case "user.button":
+		if request.Pressed == nil {
+			return response, errors.New("user.button requires pressed=true or false")
+		}
+		result, err = model.Button(request.Control, *request.Pressed)
+	case "user.fader":
+		var index int
+		index, err = simulationFaderIndex(request.Fader)
+		if err == nil {
+			result, err = model.FaderMove(index, request.Position)
+		}
+	case "user.fader-touch":
+		if request.Pressed == nil {
+			return response, errors.New("user.fader-touch requires pressed=true or false")
+		}
+		var index int
+		index, err = simulationFaderIndex(request.Fader)
+		if err == nil {
+			result, err = model.FaderTouch(index, *request.Pressed)
+		}
+	case "user.encoder-turn":
+		result, err = model.EncoderTurn(request.Encoder-1, request.Delta)
+	case "user.encoder-press":
+		if request.Pressed == nil {
+			return response, errors.New("user.encoder-press requires pressed=true or false")
+		}
+		result, err = model.Button(fmt.Sprintf("encoder.%d.press", request.Encoder), *request.Pressed)
+	case "user.jog":
+		result, err = model.Jog(request.Delta)
+	case "user.expression":
+		result, err = model.Expression(request.Value)
+	case "advance":
+		result, err = model.Advance(request.Milliseconds)
+	case "snapshot":
+		state := model.Snapshot()
+		response.Type = "snapshot"
+		response.State = &state
+		return response, nil
+	case "reset":
+		model.Reset()
+		result.Changed = []string{"*"}
+	default:
+		return response, fmt.Errorf("unknown request type %q", request.Type)
+	}
+	if err != nil {
+		return response, err
+	}
+	response.Changed = result.Changed
+	response.Warning = result.Warning
+	response.MIDI = integerMessages(result.Outbound)
+	if len(response.MIDI) > 0 {
+		response.MIDIDirection = "device-to-host"
+	}
+	return response, nil
+}
+
+func midiBytes(values []int) ([]byte, error) {
+	if len(values) == 0 {
+		return nil, errors.New("host.midi requires a non-empty bytes array")
+	}
+	message := make([]byte, len(values))
+	for index, value := range values {
+		if value < 0 || value > 255 {
+			return nil, fmt.Errorf("MIDI byte %d is out of range: %d", index, value)
+		}
+		message[index] = byte(value)
+	}
+	return message, nil
+}
+
+func integerMessages(messages [][]byte) [][]int {
+	if len(messages) == 0 {
+		return nil
+	}
+	converted := make([][]int, len(messages))
+	for messageIndex, message := range messages {
+		converted[messageIndex] = make([]int, len(message))
+		for byteIndex, value := range message {
+			converted[messageIndex][byteIndex] = int(value)
+		}
+	}
+	return converted
+}
+
+func simulationFaderIndex(raw json.RawMessage) (int, error) {
+	if len(raw) == 0 {
+		return 0, errors.New("fader must be 1..8 or \"master\"")
+	}
+	var name string
+	if err := json.Unmarshal(raw, &name); err == nil {
+		if strings.EqualFold(name, "master") {
+			return surface.FaderCount - 1, nil
+		}
+		value, conversionErr := strconv.Atoi(name)
+		if conversionErr != nil {
+			return 0, errors.New("fader must be 1..8 or \"master\"")
+		}
+		if value >= 1 && value <= surface.ChannelCount {
+			return value - 1, nil
+		}
+		return 0, errors.New("fader must be 1..8 or \"master\"")
+	}
+	var value int
+	if err := json.Unmarshal(raw, &value); err == nil && value >= 1 && value <= surface.ChannelCount {
+		return value - 1, nil
+	}
+	return 0, errors.New("fader must be 1..8 or \"master\"")
 }
 
 func runDevices(args []string, output io.Writer) error {

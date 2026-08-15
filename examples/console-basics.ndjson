@@ -1,0 +1,17 @@
+{"id":"track-name","type":"host.midi","bytes":[240,0,0,102,20,18,0,86,111,99,97,108,115,32,247]}
+{"id":"track-value","type":"host.midi","bytes":[240,0,0,102,20,18,56,45,54,46,48,100,66,32,247]}
+{"id":"strip-colors","type":"host.midi","bytes":[240,0,0,102,20,114,6,2,4,3,5,7,1,0,247]}
+{"id":"motor","type":"host.midi","bytes":[224,0,64]}
+{"id":"pan-ring","type":"host.midi","bytes":[176,48,22]}
+{"id":"mute-led","type":"host.midi","bytes":[144,16,127]}
+{"id":"meter","type":"host.midi","bytes":[208,10]}
+{"id":"meter-time","type":"advance","milliseconds":300}
+{"id":"touch","type":"user.fader-touch","fader":1,"pressed":true}
+{"id":"move","type":"user.fader","fader":1,"position":12288}
+{"id":"release","type":"user.fader-touch","fader":1,"pressed":false}
+{"id":"pan","type":"user.encoder-turn","encoder":1,"delta":2}
+{"id":"mute-down","type":"user.button","control":"channel.1.mute","pressed":true}
+{"id":"mute-up","type":"user.button","control":"channel.1.mute","pressed":false}
+{"id":"bank-right","type":"user.button","control":"bank.right","pressed":true}
+{"id":"play","type":"user.button","control":"transport.play","pressed":true}
+{"id":"snapshot","type":"snapshot"}
